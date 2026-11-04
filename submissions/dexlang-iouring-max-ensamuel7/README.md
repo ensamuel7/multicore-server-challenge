@@ -28,7 +28,7 @@ connection for writes and logins and listens on port 80 with `SO_REUSEPORT`, so
 the kernel spreads connections across them.
 
 **Read lanes.** Before forking the workers, the server calls
-`http.lanes(6, serve)`, which starts six lane processes. Each lane listens on its
+`http.lanes(8, serve)`, which starts eight lane processes. Each lane listens on its
 own unix socket and owns one Postgres connection with the batched read
 statements prepared. A read handler (`/api/tags`, `/api/user`, a profile, an
 article, its comments, and every list and feed) checks its input, then
@@ -38,12 +38,14 @@ waits behind a slower kind:
 
 | lane | reads |
 |--:|---|
-| 0 | global, by tag, by author, favorited lists |
+| 0 | global list |
 | 1 | feed |
 | 2 | comments |
 | 3 | article |
-| 4 | tags |
-| 5 | profile, current user |
+| 4 | tags, profile, current user |
+| 5 | list by tag |
+| 6 | list by author |
+| 7 | favorited list |
 
 A lane collects requests from all 16 workers for 20 ms (`http.batchWindow(20)`,
 `BATCH_MS`) from its first request, then calls `serve` with the batch. `serve`
@@ -60,7 +62,7 @@ answered 503, and the lane is not restarted.
 
 **Writes and logins answer at once.** Writes run on the worker's connection as
 they arrive, each committed before its response. A bcrypt login (about 60 ms of
-CPU) holds only its own worker. That's 16 worker connections and 6 lane
+CPU) holds only its own worker. That's 16 worker connections and 8 lane
 connections, well under the 95 allowed.
 
 **io_uring with direct descriptors**: accepts, receives and sends are queued on
@@ -85,6 +87,13 @@ statements against the per-request ones over 300 random batches.
   counts each distinct filter once, cuts each distinct page once, and decorates
   each distinct article once (tags, favorite count, author). Only the
   `favorited` and `following` flags are per request.
+- **The feed counts only when it must.** The feed's total is capped at 1,000,
+  so a viewer who follows an author with 1,000 or more articles has a total of
+  1,000. The feed statement finds such authors among the followees shared by
+  the batch's viewers, checked once each by looking for a 1,000th article, and
+  counts only for the other viewers. Every feed article is by someone the
+  viewer follows, so `following` is `true` without a lookup. It returned the
+  same rows as the counting statement in 60 random batches on the full seed.
 - **Pick the page first, then decorate it.** The reference list query computes
   tags, favorite counts and both `EXISTS` for every row `OFFSET` skips. Each
   list here selects the page's ids first, from the index that orders it, and
@@ -123,12 +132,15 @@ other boxes, 42,000 users, 60 s ramp and 60 s measured, 8 workers:
 | version | req/s | p50 | p95 | p99 | errors | box CPU | server | Postgres |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|
 | per-worker batches (`dexlang-iouring-ensamuel7`) | 10,751 | | 249 ms | 326 ms | 0% | 86% | 34% | 51% |
-| read lanes | 11,008 | 33 ms | 161 ms | 410 ms | 0% | 80% | 37% | 42% |
+| 6 read lanes, all lists in one | 11,008 | 33 ms | 161 ms | 410 ms | 0% | 80% | 37% | 42% |
+| 8 read lanes, feed without counting | 11,045 | 28 ms | 129 ms | 250 ms | 0% | 82% | 37% | 44% |
+| the same, again | 11,046 | 29 ms | 129 ms | 215 ms | 0% | 83% | 37% | 44% |
 
-At the same load the lanes take Postgres from 51% of the box to 42%, and p95
-from 249 to 161 ms. p99 rose because lane 0 runs its four list statements one
-after another for each batch. Past about 45,000 users the two load boxes ran
-out of CPU, so the 4-vCPU ceiling was not reached.
+With all four lists in one lane, that lane ran their statements one after
+another for each batch, and p99 rose to 410 ms. Giving each list its own lane
+brought p99 to 215-250 ms and p95 to 129 ms, against 249 and 326 ms with
+per-worker batches. Postgres is 44% of the box against 51%. Past about 45,000
+users the two load boxes ran out of CPU, so the 4-vCPU ceiling was not reached.
 
 ## What the language gained from this challenge
 

@@ -580,7 +580,7 @@ struct Held {
 }
 
 let batchSt: int[] = []
-let laneCount: int = 6
+let laneCount: int = 8
 let dsnUrl: string = ""
 
 fn laneOf(kind: int): int {
@@ -591,10 +591,14 @@ fn laneOf(kind: int): int {
         lane = 2
     } else if (kind == K_ARTICLE) {
         lane = 3
-    } else if (kind == K_TAGS) {
+    } else if (kind == K_TAGS || kind == K_PROFILE || kind == K_USER) {
         lane = 4
-    } else if (kind == K_PROFILE || kind == K_USER) {
+    } else if (kind == K_TAG) {
         lane = 5
+    } else if (kind == K_AUTHOR) {
+        lane = 6
+    } else if (kind == K_FAVORITED) {
+        lane = 7
     }
     return lane % laneCount
 }

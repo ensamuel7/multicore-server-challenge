@@ -150,9 +150,19 @@ fn batched(query: q.Select, order: q.Expr[]): q.Query throws q.QueryError {
     return s.build(PG)
 }
 
+struct Cte {
+    name: string
+    query: q.Select
+}
+
 fn sharedList(key: string, count: q.Select, ids: q.Select): q.Query throws q.QueryError {
     let distinctKeys: q.Select = q.from("r").distinct().select([q.col(key).alias("key")])
     let counts: q.Select = q.select([q.col("d.key"), q.sub(count).alias("total")]).fromExpr(q.sub(distinctKeys).alias("d"))
+    let none: Cte[] = []
+    return sharedSelect(key, none, counts, ids, follows(q.col("r.v"), q.col("x.author_id"))).build(PG)
+}
+
+fn sharedSelect(key: string, before: Cte[], counts: q.Select, ids: q.Select, following: q.Expr): q.Select {
     let pages: q.Select = q.from("r").distinct().select([q.col(key).alias("key"), q.col("l"), q.col("o")])
     let pageIds: q.Select = q.select(cols(["g.key", "g.l", "g.o", "q.id"])).from("g").crossJoinLateral(q.sub(ids).alias("q"))
     let article: q.Select = q.from("articles ar").where(q.col("ar.id").eq(q.col("d.id"))).limitExpr(one())
@@ -165,11 +175,13 @@ fn sharedList(key: string, count: q.Select, ids: q.Select): q.Query throws q.Que
     let picked: q.Expr[] = cols(["r.i", "c.total", "x.id", "x.slug", "x.title", "x.description", "x.created_at", "x.updated_at", "x.tag_list", "x.favorites_count"])
     picked.push(q.caseWhen(present, favoritedBy(q.col("x.id"), q.col("r.v"))).end().alias("favorited"))
     picked = append(picked, cols(["x.username", "x.bio", "x.image"]))
-    picked.push(q.caseWhen(present, follows(q.col("r.v"), q.col("x.author_id"))).end().alias("following"))
+    picked.push(q.caseWhen(present, following).end().alias("following"))
     let rk: q.Expr = q.col("r." + key)
-    let s: q.Select = q.from("r").select(picked)
-        .withMaterialized("r", q.select([q.star()]).fromExpr(requests()))
-        .withMaterialized("c", counts)
+    let s: q.Select = q.from("r").select(picked).withMaterialized("r", q.select([q.star()]).fromExpr(requests()))
+    foreach (before as cte) {
+        s = s.withMaterialized(cte.name, cte.query)
+    }
+    return s.withMaterialized("c", counts)
         .withMaterialized("g", pages)
         .withMaterialized("p", pageIds)
         .withMaterialized("x", decorated)
@@ -178,7 +190,6 @@ fn sharedList(key: string, count: q.Select, ids: q.Select): q.Query throws q.Que
         .leftJoin("x", q.col("x.id").eq(q.col("p.id")))
         .orderBy("r.i")
         .orderByExpr(q.col("x.id").desc())
-    return s.build(PG)
 }
 
 fn slugOf(title: q.Expr): q.Expr {
@@ -364,5 +375,14 @@ fn batchListFavorited(): q.Query throws q.QueryError {
 }
 
 fn batchListFeed(): q.Query throws q.QueryError {
-    return sharedList("v", countFeed(q.col("d.key")), idsFeed(q.col("g.key"), q.col("g.l"), q.col("g.o")))
+    let viewers: q.Select = q.from("r").distinct().columns(["v"])
+    let viewerFollows: q.Select = q.from("dv").select([q.col("dv.v"), q.col("fo.followee_id").alias("f")]).join("follows fo", q.col("fo.follower_id").eq(q.col("dv.v")))
+    let shared: q.Select = q.from("vf").columns(["f"]).groupBy(["f"]).having(q.countAll().gt(q.raw("1")))
+    let thousandth: q.Select = q.from("articles a").select([one()]).where(q.col("a.author_id").eq(q.col("s.f"))).orderByExpr(q.col("a.id")).offsetExpr(q.raw("999")).limitExpr(one())
+    let hubs: q.Select = q.select([q.col("s.f")]).fromExpr(q.sub(shared).alias("s")).where(q.exists(thousandth))
+    let hubViewers: q.Select = q.from("vf").distinct().select([q.col("vf.v")]).join("hub", q.col("hub.f").eq(q.col("vf.f")))
+    let total: q.Expr = q.caseWhen(q.col("hv.v").isNotNull(), q.raw("1000").cast("int8")).orElse(q.sub(countFeed(q.col("d.v")))).alias("total")
+    let counts: q.Select = q.from("dv d").select([q.col("d.v").alias("key"), total]).leftJoin("hv", q.col("hv.v").eq(q.col("d.v")))
+    let before: Cte[] = [Cte { name: "dv", query: viewers }, Cte { name: "vf", query: viewerFollows }, Cte { name: "hub", query: hubs }, Cte { name: "hv", query: hubViewers }]
+    return sharedSelect("v", before, counts, idsFeed(q.col("g.key"), q.col("g.l"), q.col("g.o")), q.boolean(true)).build(PG)
 }
